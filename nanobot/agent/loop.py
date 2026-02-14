@@ -23,6 +23,7 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import Session, SessionManager
+from nanobot.session.token_store import TokenStore
 
 
 class AgentLoop:
@@ -46,7 +47,7 @@ class AgentLoop:
         max_iterations: int = 20,
         temperature: float = 0.7,
         max_tokens: int = 4096,
-        memory_window: int = 50,
+        memory_window: int = 100,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
@@ -68,10 +69,32 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
-
+        
+        # Store current message context for error notifications
+        self._current_message_context = {}
+        
+        # Set error callback for provider if it supports it
+        if hasattr(self.provider, 'error_callback'):
+            async def error_callback(error_message):
+                # Get current message context
+                context = self._current_message_context
+                if context:
+                    # Send error notification
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=context['channel'],
+                            chat_id=context['chat_id'],
+                            content=error_message
+                        )
+                    )
+            
+            self.provider.error_callback = error_callback
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+        
+        # Load max_window_context from config
+        self.max_window_context = self._load_max_window_context()
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -146,63 +169,139 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
-    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
+    def _load_max_window_context(self) -> int:
+        """Load max_window_context from config, default to 100000."""
+        try:
+            from nanobot.config.loader import load_config
+            config = load_config()
+            return config.agents.defaults.max_window_context
+        except Exception as e:
+            logger.debug(f"Could not load max_window_context from config: {e}")
+            return 100000  # Default value
+
+    async def _summarize_context(self, messages: list[dict[str, Any]]) -> str:
         """
-        Run the agent iteration loop.
+        Use LLM to summarize older messages for context compression.
 
         Args:
-            initial_messages: Starting messages for the LLM conversation.
+            messages: List of older messages to summarize.
 
         Returns:
-            Tuple of (final_content, list_of_tools_used).
+            Summary string with prefix note.
         """
-        messages = initial_messages
-        iteration = 0
-        final_content = None
-        tools_used: list[str] = []
+        # Build an optimized prompt for better summarization
+        summary_prompt = """Please summarize the following conversation comprehensively.
 
-        while iteration < self.max_iterations:
-            iteration += 1
+IMPORTANT: Pay special attention to and PRESERVE:
+- User's explicit requirements, requests, or instructions (marked with emphasis like **, CAPS, or explicit statements)
+- Technical details, configuration values, file paths, or code snippets
+- Decisions made or conclusions reached
+- Any unresolved questions or pending tasks
 
+Conversation to summarize:
+"""
+
+        # Format messages for the prompt (no truncation - keep full content)
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, str) and content:
+                summary_prompt += f"\n{role}: {content}"
+
+        summary_prompt += "\n\nProvide a comprehensive summary that captures all important details, especially user requirements and technical information:"
+
+        try:
+            # Call LLM to generate summary
             response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
+                messages=[{"role": "user", "content": summary_prompt}],
                 model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
+                max_tokens=1500,  # Allow longer summary for comprehensive coverage
+                temperature=0.3   # Lower temperature for more accurate summarization
             )
 
-            if response.has_tool_calls:
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                )
-
-                for tool_call in response.tool_calls:
-                    tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
+            # Handle response safely - content might be dict in some error cases
+            content = response.content
+            if isinstance(content, dict):
+                content = str(content)
+            
+            if content:
+                summary = content.strip() if hasattr(content, 'strip') else str(content)
+                # Add prefix note to the summary
+                prefix = "This is a summary of previous conversation. Some details may have been optimized. If anything is unclear, please ask directly.\n\n"
+                return prefix + summary
             else:
-                final_content = response.content
-                break
+                # Fallback: return count-based summary
+                user_msgs = sum(1 for m in messages if m.get("role") == "user")
+                assistant_msgs = sum(1 for m in messages if m.get("role") == "assistant")
+                return f"This is a summary of previous conversation. Some details may have been optimized. If anything is unclear, please ask directly.\n\n{user_msgs} user messages and {assistant_msgs} assistant responses (details compressed)"
 
-        return final_content, tools_used
+        except Exception as e:
+            logger.warning(f"Failed to generate LLM summary: {e}")
+            # Fallback: return simple count with prefix
+            return f"This is a summary of previous conversation. Some details may have been optimized. If anything is unclear, please ask directly.\n\n{len(messages)} messages (compression failed, using basic summary)"
+
+    async def _compress_single_message(self, content: str) -> str:
+        """
+        Compress a single long message using LLM.
+        First truncate if too long, then compress.
+        
+        Args:
+            content: The long message content to compress.
+            
+        Returns:
+            Compressed content within token limits.
+        """
+        from nanobot.session.manager import estimate_tokens
+        
+        # First check if content is too long for compression LLM
+        # Assume compression LLM has similar maxWindowContext limit
+        content_tokens = estimate_tokens(content)
+        max_compress_input = int(self.max_window_context * 0.8)  # Use 80% of limit for safety
+        
+        if content_tokens > max_compress_input:
+            # Truncate before compression
+            logger.debug(f"Message too long for compression ({content_tokens} tokens), truncating first...")
+            # Reserve 500 tokens for prompt overhead, truncate the rest
+            keep_chars = int((max_compress_input - 500) * 2.12)
+            truncated_notice = "\n\n[Content truncated before compression - showing first part only]"
+            content = content[:keep_chars] + truncated_notice
+        
+        compress_prompt = """Please compress the following text while preserving key information:
+- Keep important keywords and technical details
+- Maintain the core meaning and context
+- Be as detailed as possible within the limit
+- Preserve any code snippets, file paths, or configuration values
+
+Text to compress:
+"""
+        compress_prompt += f"\n{content}\n\nCompressed version (within 1500 characters):"
+        
+        try:
+            response = await self.provider.chat(
+                messages=[{"role": "user", "content": compress_prompt}],
+                model=self.model,
+                max_tokens=2000,  # Allow up to 2000 tokens for detailed compression
+                temperature=0.3
+            )
+            
+            # Handle response safely - content might be dict in some error cases
+            content = response.content
+            if isinstance(content, dict):
+                content = str(content)
+            
+            if content:
+                compressed = content.strip() if hasattr(content, 'strip') else str(content)
+                # Add prefix note
+                prefix = "[This message was compressed due to length. Original was too long for context window. Key points preserved:]\n\n"
+                return prefix + compressed
+            else:
+                # Fallback: truncate with notice
+                return "[Message too long and compression failed. Key content may be missing.]"
+                
+        except Exception as e:
+            logger.warning(f"Failed to compress single message: {e}")
+            # Fallback: return error notice
+            return "[Message too long and compression failed. Key content may be missing.]"
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -221,7 +320,11 @@ class AgentLoop:
                     if response:
                         await self.bus.publish_outbound(response)
                 except Exception as e:
+
                     logger.error(f"Error processing message: {e}")
+
+                    # Send error response
+
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
@@ -259,10 +362,22 @@ class AgentLoop:
         if msg.channel == "system":
             return await self._process_system_message(msg)
         
+        key = session_key or msg.session_key
+        
+        # Set current message context for error notifications and token tracking
+        self._current_message_context = {
+            'channel': msg.channel,
+            'chat_id': msg.chat_id,
+            'session_key': key
+        }
+        
+        # Set session_key in provider for token tracking
+        if hasattr(self.provider, 'session_key'):
+            self.provider.session_key = key
+        
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
         
-        key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
         
         # Handle slash commands
@@ -270,35 +385,216 @@ class AgentLoop:
         if cmd == "/new":
             # Capture messages before clearing (avoid race condition with background task)
             messages_to_archive = session.messages.copy()
+            # Summarize conversation and save to daily notes
+            summary = await self._summarize_for_daily_notes(session)
+            if summary:
+                memory = MemoryStore(self.workspace)
+                memory.append_today(summary)
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
 
-            async def _consolidate_and_cleanup():
-                temp_session = Session(key=session.key)
-                temp_session.messages = messages_to_archive
-                await self._consolidate_memory(temp_session, archive_all=True)
 
-            asyncio.create_task(_consolidate_and_cleanup())
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+
                                   content="New session started. Memory consolidation in progress.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
         
-        if len(session.messages) > self.memory_window:
-            asyncio.create_task(self._consolidate_memory(session))
+
 
         self._set_tool_context(msg.channel, msg.chat_id)
+        if cmd == "/reset":
+            # Reset session without memory consolidation (like Feishu)
+            msg_count = len(session.messages)
+            session.clear()
+            self.sessions.save(session)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=f"🐈 Session reset. Cleared {msg_count} messages.")
+        if cmd == "/token":
+            # Show token usage statistics
+            token_store = TokenStore()
+            usage = token_store.get_summary()
+            
+            def fmt(n: int) -> str:
+                return f"{n:,}"
+            
+            lines = ["🐈 **Token Usage Statistics**\n"]
+            
+            periods = [
+                ("Today", usage["today"]),
+                ("This Week", usage["this_week"]),
+                ("This Month", usage["this_month"]),
+                ("All Time", usage["all_time"]),
+            ]
+            
+            for period_name, data in periods:
+                if data["request_count"] > 0:
+                    lines.append(f"**{period_name}:**")
+                    lines.append(f"  Requests: {fmt(data['request_count'])}")
+                    lines.append(f"  Input: {fmt(data['prompt_tokens'])} tokens")
+                    lines.append(f"  Output: {fmt(data['completion_tokens'])} tokens")
+                    lines.append(f"  Total: {fmt(data['total_tokens'])} tokens")
+                    lines.append("")
+            
+            # Model breakdown for All Time
+            model_usage = usage["all_time"].get("model_usage", {})
+            if model_usage:
+                lines.append("**By Model (All Time):**")
+                sorted_models = sorted(
+                    model_usage.items(),
+                    key=lambda x: x[1]["total_tokens"],
+                    reverse=True
+                )
+                for model_name, data in sorted_models:
+                    lines.append(f"  {model_name}: {fmt(data['request_count'])} req, {fmt(data['total_tokens'])} tokens")
+            
+            if len(lines) == 1:
+                lines.append("No token usage data available yet. Start a conversation to begin tracking.")
+            
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines))
+        
+        if cmd == "/help":
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/reset — Reset session without saving memory\n/token — Show token usage statistics\n/help — Show available commands")
+
+        # Update tool contexts
+        message_tool = self.tools.get("message")
+        if isinstance(message_tool, MessageTool):
+            message_tool.set_context(msg.channel, msg.chat_id)
+
+        spawn_tool = self.tools.get("spawn")
+        if isinstance(spawn_tool, SpawnTool):
+            spawn_tool.set_context(msg.channel, msg.chat_id)
+
+        cron_tool = self.tools.get("cron")
+        if isinstance(cron_tool, CronTool):
+            cron_tool.set_context(msg.channel, msg.chat_id)
+
+        # Get history and check if compression needed
+        from nanobot.session.manager import estimate_messages_tokens, estimate_tokens
+        raw_history = session.get_history(max_messages=50)
+        history_tokens = estimate_messages_tokens(raw_history)
+
+        # Log current token usage
+        logger.info(f"Current context: ~{history_tokens} tokens (maxWindowContext: {self.max_window_context})")
+
+        # Check for single message exceeding limit
+        max_single_msg_tokens = 0
+        longest_msg_idx = -1
+        for i, hist_msg in enumerate(raw_history):
+            msg_tokens = estimate_tokens(hist_msg.get("content", ""))
+            if msg_tokens > max_single_msg_tokens:
+                max_single_msg_tokens = msg_tokens
+                longest_msg_idx = i
+        
+        # Initialize history with raw_history
+        history = raw_history
+        
+        # Step 1: Handle single message exceeding limit
+        if max_single_msg_tokens > self.max_window_context:
+            # Single message exceeds limit - use LLM to compress it
+            logger.warning(f"Single message exceeds maxWindowContext: ~{max_single_msg_tokens} tokens > {self.max_window_context}, compressing with LLM...")
+            
+            # Compress long messages using LLM
+            new_history = []
+            for i, hist_msg in enumerate(history):
+                msg_tokens = estimate_tokens(hist_msg.get("content", ""))
+                if msg_tokens > self.max_window_context:
+                    # Use LLM to compress this single message
+                    content = hist_msg.get("content", "")
+                    compressed_content = await self._compress_single_message(content)
+                    new_history.append({
+                        "role": hist_msg.get("role", "assistant"),
+                        "content": compressed_content
+                    })
+                    logger.info(f"Compressed message {i} from {len(content)} chars to {len(compressed_content)} chars")
+                else:
+                    new_history.append(hist_msg)
+            
+            # Update history with compressed version
+            history = new_history
+            
+            # Sync compressed content back to session.messages to persist the compression
+            # This ensures next conversation uses compressed version
+            session.messages = []
+            for hist_msg in history:
+                session.messages.append({
+                    "role": hist_msg.get("role", "assistant"),
+                    "content": hist_msg.get("content", ""),
+                    "timestamp": hist_msg.get("timestamp", 0)
+                })
+            
+            # Immediately save to disk to persist compression
+            self.sessions.save(session)
+            logger.info(f"Synced compressed messages back to session and saved to disk")
+            
+            # Recalculate tokens after single message compression
+            history_tokens = estimate_messages_tokens(history)
+            logger.info(f"After single message compression: ~{history_tokens} tokens")
+        
+        # Step 2: Check if total still exceeds limit after single message handling
+        if history_tokens > self.max_window_context:
+            # Need to compress using LLM
+            logger.info(f"Context window exceeded: ~{history_tokens} tokens > {self.max_window_context}, compressing with LLM...")
+            # Use custom compression: keep last 50 non-system messages for better context retention
+            all_messages = session.messages
+            system_msgs = [m for m in all_messages if m.get("role") == "system"]
+            non_system_msgs = [m for m in all_messages if m.get("role") != "system"]
+            recent_msgs = non_system_msgs[-50:] if len(non_system_msgs) > 50 else non_system_msgs
+            older_msgs = non_system_msgs[:-50] if len(non_system_msgs) > 50 else []
+
+            if older_msgs:
+                # Use LLM to summarize older messages
+                summary = await self._summarize_context(older_msgs)
+                # Build compressed history: keep all system messages + recent messages + summary as assistant message
+                history = []
+                
+                # Add all system messages (unchanged)
+                history.extend(system_msgs)
+                
+                # Add summary as a user message (to indicate it's compressed context)
+                history.append({
+                    "role": "user",
+                    "content": "[Earlier conversation context has been compressed. Key points below:]"
+                })
+                
+                # Add the summary as assistant message
+                history.append({
+                    "role": "assistant",
+                    "content": summary
+                })
+                
+                # Add recent messages (unchanged)
+                history.extend(recent_msgs)
+                
+                logger.info(f"Context compressed: {len(older_msgs)} older messages summarized into assistant message")
+                logger.debug(f"Summary preview: {summary[:150]}...")
+            else:
+                history = raw_history
+        else:
+            history = raw_history
+
+        # Build initial messages
         initial_messages = self.context.build_messages(
-            history=session.get_history(max_messages=self.memory_window),
+            history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
-        final_content, tools_used = await self._run_agent_loop(initial_messages)
 
+        # Log initial system prompt on first message (empty history)
+        if not raw_history:
+            system_prompt = initial_messages[0].get("content", "") if initial_messages else ""
+            system_tokens = len(system_prompt) // 4  # Rough estimate
+            logger.info(f"=== Initial System Prompt ({system_tokens} tokens) ===")
+            logger.info(system_prompt[:2000] + "..." if len(system_prompt) > 2000 else system_prompt)
+            logger.info("=== End of System Prompt ===")
+
+        # Use the existing _run_agent_loop method
+        final_content, tools_used = await self._run_agent_loop(initial_messages)
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
         
@@ -336,6 +632,16 @@ class AgentLoop:
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
         
+
+
+        # Set current message context for error notifications
+        self._current_message_context = {
+            'channel': origin_channel,
+            'chat_id': origin_chat_id
+        }
+        
+        # Use the origin session for context
+
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
         self._set_tool_context(origin_channel, origin_chat_id)
@@ -359,67 +665,43 @@ class AgentLoop:
             chat_id=origin_chat_id,
             content=final_content
         )
-    
-    async def _consolidate_memory(self, session, archive_all: bool = False) -> None:
-        """Consolidate old messages into MEMORY.md + HISTORY.md.
 
-        Args:
-            archive_all: If True, clear all messages and reset session (for /new command).
-                       If False, only write to files without modifying session.
-        """
-        memory = MemoryStore(self.workspace)
+    async def _summarize_for_daily_notes(self, session) -> str:
+        """Summarize conversation for daily notes using LLM."""
+        if not session.messages:
+            return ""
 
-        if archive_all:
-            old_messages = session.messages
-            keep_count = 0
-            logger.info(f"Memory consolidation (archive_all): {len(session.messages)} total messages archived")
-        else:
-            keep_count = self.memory_window // 2
-            if len(session.messages) <= keep_count:
-                logger.debug(f"Session {session.key}: No consolidation needed (messages={len(session.messages)}, keep={keep_count})")
-                return
-
-            messages_to_process = len(session.messages) - session.last_consolidated
-            if messages_to_process <= 0:
-                logger.debug(f"Session {session.key}: No new messages to consolidate (last_consolidated={session.last_consolidated}, total={len(session.messages)})")
-                return
-
-            old_messages = session.messages[session.last_consolidated:-keep_count]
-            if not old_messages:
-                return
-            logger.info(f"Memory consolidation started: {len(session.messages)} total, {len(old_messages)} new to consolidate, {keep_count} keep")
-
+        # Format messages for LLM
         lines = []
-        for m in old_messages:
+        for m in session.messages:
             if not m.get("content"):
                 continue
-            tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
-            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
+            role = m.get('role', 'unknown')
+            content = m.get('content', '')
+            lines.append(f"[{role.upper()}]: {content}")
         conversation = "\n".join(lines)
-        current_memory = memory.read_long_term()
 
-        prompt = f"""You are a memory consolidation agent. Process this conversation and return a JSON object with exactly two keys:
+        prompt = f""" You are a memory consolidation agent.  Summarize the following conversation concisely. Focus on:
+1. Main topics discussed，A paragraph (2-5 sentences) summarizing the key events/decisions/topics. Start with a timestamp like [YYYY-MM-DD HH:MM]. Include enough detail to be useful when found by grep search later.
+2. Key decisions or actions taken
+3. Important information to remember
 
-1. "history_entry": A paragraph (2-5 sentences) summarizing the key events/decisions/topics. Start with a timestamp like [YYYY-MM-DD HH:MM]. Include enough detail to be useful when found by grep search later.
+Keep it. Write in Chinese (中文), using a neutral, informative tone.
 
-2. "memory_update": The updated long-term memory content. Add any new facts: user location, preferences, personal info, habits, project context, technical decisions, tools/services used. If nothing new, return the existing content unchanged.
-
-## Current Long-term Memory
-{current_memory or "(empty)"}
-
-## Conversation to Process
+Conversation:
 {conversation}
 
-Respond with ONLY valid JSON, no markdown fences."""
+Summary (in Chinese):"""
 
         try:
             response = await self.provider.chat(
                 messages=[
-                    {"role": "system", "content": "You are a memory consolidation agent. Respond only with valid JSON."},
+                    {"role": "system", "content": "You are a helpful assistant that summarizes conversations."},
                     {"role": "user", "content": prompt},
                 ],
                 model=self.model,
             )
+<<<<<<< HEAD
             text = (response.content or "").strip()
             if not text:
                 logger.warning("Memory consolidation: LLM returned empty response, skipping")
@@ -443,7 +725,66 @@ Respond with ONLY valid JSON, no markdown fences."""
                 session.last_consolidated = len(session.messages) - keep_count
             logger.info(f"Memory consolidation done: {len(session.messages)} messages, last_consolidated={session.last_consolidated}")
         except Exception as e:
-            logger.error(f"Memory consolidation failed: {e}")
+            logger.error(f"Failed to summarize conversation: {e}")
+            return ""
+
+
+
+    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
+        """
+        Run the agent iteration loop.
+
+        Args:
+            initial_messages: Starting messages for the LLM conversation.
+
+        Returns:
+            Tuple of (final_content, list_of_tools_used).
+        """
+        messages = initial_messages
+        iteration = 0
+        final_content = None
+        tools_used: list[str] = []
+
+        while iteration < self.max_iterations:
+            iteration += 1
+
+            response = await self.provider.chat(
+                messages=messages,
+                tools=self.tools.get_definitions(),
+                model=self.model
+            )
+
+            if response.has_tool_calls:
+                tool_call_dicts = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments)
+                        }
+                    }
+                    for tc in response.tool_calls
+                ]
+                messages = self.context.add_assistant_message(
+                    messages, response.content, tool_call_dicts,
+                    reasoning_content=response.reasoning_content,
+                )
+
+                for tool_call in response.tool_calls:
+                    tools_used.append(tool_call.name)
+                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    messages = self.context.add_tool_result(
+                        messages, tool_call.id, tool_call.name, result
+                    )
+                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
+            else:
+                final_content = response.content
+                break
+
+        return final_content, tools_used
 
     async def process_direct(
         self,
