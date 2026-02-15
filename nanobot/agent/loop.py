@@ -396,7 +396,6 @@ Text to compress:
 
 
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-
                                   content="New session started. Memory consolidation in progress.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
@@ -585,13 +584,6 @@ Text to compress:
             chat_id=msg.chat_id,
         )
 
-        # # Log initial system prompt on first message (empty history)
-        # if not raw_history:
-        #     system_prompt = initial_messages[0].get("content", "") if initial_messages else ""
-        #     system_tokens = len(system_prompt) // 4  # Rough estimate
-        #     logger.info(f"=== Initial System Prompt ({system_tokens} tokens) ===")
-        #     logger.info(system_prompt[:2000] + "..." if len(system_prompt) > 2000 else system_prompt)
-        #     logger.info("=== End of System Prompt ===")
 
         # Use the existing _run_agent_loop method
         final_content, tools_used = await self._run_agent_loop(initial_messages)
@@ -701,29 +693,12 @@ Summary (in Chinese):"""
                 ],
                 model=self.model,
             )
-<<<<<<< HEAD
-            text = (response.content or "").strip()
-            if not text:
-                logger.warning("Memory consolidation: LLM returned empty response, skipping")
-                return
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            result = json_repair.loads(text)
-            if not isinstance(result, dict):
-                logger.warning(f"Memory consolidation: unexpected response type, skipping. Response: {text[:200]}")
-                return
-
-            if entry := result.get("history_entry"):
-                memory.append_history(entry)
-            if update := result.get("memory_update"):
-                if update != current_memory:
-                    memory.write_long_term(update)
-
-            if archive_all:
-                session.last_consolidated = 0
-            else:
-                session.last_consolidated = len(session.messages) - keep_count
-            logger.info(f"Memory consolidation done: {len(session.messages)} messages, last_consolidated={session.last_consolidated}")
+            summary = (response.content or "").strip()
+            if summary:
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                return f"## Session Summary [{timestamp}]\n\n{summary}\n"
+            return ""
         except Exception as e:
             logger.error(f"Failed to summarize conversation: {e}")
             return ""
