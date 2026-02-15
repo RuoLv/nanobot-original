@@ -3,9 +3,8 @@
 import asyncio
 from contextlib import AsyncExitStack
 import json
-import json_repair
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
@@ -72,6 +71,9 @@ class AgentLoop:
         
         # Store current message context for error notifications
         self._current_message_context = {}
+        
+        # Tool output callback for real-time updates
+        self._tool_output_callback: Callable | None = None
         
         # Set error callback for provider if it supports it
         if hasattr(self.provider, 'error_callback'):
@@ -168,6 +170,14 @@ class AgentLoop:
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
+    
+    def set_tool_output_callback(self, callback: Callable | None) -> None:
+        """Set callback for real-time tool output.
+        
+        Args:
+            callback: Async function that accepts (channel, chat_id, tool_name, output) or None to disable
+        """
+        self._tool_output_callback = callback
 
     def _load_max_window_context(self) -> int:
         """Load max_window_context from config, default to 100000."""
@@ -393,10 +403,12 @@ Text to compress:
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
-
-
+            
+            # Build greeting message with memory context
+            greeting_response = await self._generate_new_session_greeting()
+            
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started. Memory consolidation in progress.")
+                                  content=greeting_response)
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
@@ -586,23 +598,32 @@ Text to compress:
 
 
         # Use the existing _run_agent_loop method
-        final_content, tools_used = await self._run_agent_loop(initial_messages)
+        final_content, tools_used, model_name = await self._run_agent_loop(initial_messages)
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
         
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
+        # Clean up leading/trailing whitespace and newlines
+        final_content = final_content.strip()
         
+        # Save to session without model prefix (only keep original content)
         session.add_message("user", msg.content)
         session.add_message("assistant", final_content,
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
+        
+        # Add model prefix to final output (only for user display)
+        if model_name:
+            final_content = f"[{model_name}]:\n{final_content}"
+        
+        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+        logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
         
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
             metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
+            message_id=msg.metadata.get("message_id") if msg.metadata else None,
         )
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -643,14 +664,19 @@ Text to compress:
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
-        final_content, _ = await self._run_agent_loop(initial_messages)
+        final_content, _, model_name = await self._run_agent_loop(initial_messages)
 
         if final_content is None:
             final_content = "Background task completed."
         
+        # Save to session without model prefix
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
         session.add_message("assistant", final_content)
         self.sessions.save(session)
+        
+        # Add model prefix to final output (only for user display)
+        if model_name:
+            final_content = f"[{model_name}]:\n{final_content}"
         
         return OutboundMessage(
             channel=origin_channel,
@@ -703,6 +729,50 @@ Summary (in Chinese):"""
             logger.error(f"Failed to summarize conversation: {e}")
             return ""
 
+    async def _generate_new_session_greeting(self) -> str:
+        """Generate a greeting for new session with memory context."""
+        try:
+            # Build system prompt
+            system_prompt = self.context.build_system_prompt()
+            
+            # Get memory context (long-term memory + today's notes)
+            memory = MemoryStore(self.workspace)
+            memory_context = memory.get_memory_context()
+            
+            # Get today's notes
+            today_notes = memory.read_today()
+            if today_notes:
+                memory_context = f"{memory_context}\n\n## Today's Notes\n\n{today_notes}" if memory_context else f"## Today's Notes\n\n{today_notes}"
+            
+            # Build messages
+            messages = [
+                {"role": "system", "content": system_prompt},
+            ]
+            
+            if memory_context:
+                messages.append({
+                    "role": "user", 
+                    "content": f"这是我们之前的对话记忆：\n\n{memory_context}"
+                })
+            
+            messages.append({
+                "role": "user",
+                "content": "现在开始了新的对话，请打招呼"
+            })
+            
+            # Call LLM
+            response = await self.provider.chat(
+                messages=messages,
+                model=self.model,
+            )
+            
+            greeting = (response.content or "新会话已开始，有什么可以帮助你的吗？").strip()
+            return greeting
+            
+        except Exception as e:
+            logger.error(f"Failed to generate new session greeting: {e}")
+            return "新会话已开始，有什么可以帮助你的吗？"
+
 
 
     async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
@@ -713,12 +783,13 @@ Summary (in Chinese):"""
             initial_messages: Starting messages for the LLM conversation.
 
         Returns:
-            Tuple of (final_content, list_of_tools_used).
+            Tuple of (final_content, list_of_tools_used, model_name).
         """
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        model_name = None
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -728,8 +799,31 @@ Summary (in Chinese):"""
                 tools=self.tools.get_definitions(),
                 model=self.model
             )
+            
+            # Capture model name from response
+            if response.model:
+                model_name = response.model
 
             if response.has_tool_calls:
+                # Send LLM's intermediate response (combine reasoning and content)
+                if self._tool_output_callback and self._current_message_context:
+                    try:
+                        parts = []
+                        if response.reasoning_content:
+                            parts.append(response.reasoning_content.strip())
+                        if response.content:
+                            parts.append(response.content.strip())
+                        if parts:
+                            combined = "    ".join(parts)
+                            await self._tool_output_callback(
+                                self._current_message_context.get('channel'),
+                                self._current_message_context.get('chat_id'),
+                                "🤔",
+                                f"🤔 Thinking...\n{combined}".strip()
+                            )
+                    except Exception as e:
+                        logger.warning(f"LLM intermediate output callback failed: {e}")
+                
                 tool_call_dicts = [
                     {
                         "id": tc.id,
@@ -750,16 +844,43 @@ Summary (in Chinese):"""
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    
+                    # Send tool call notification
+                    if self._tool_output_callback and self._current_message_context:
+                        try:
+                            await self._tool_output_callback(
+                                self._current_message_context.get('channel'),
+                                self._current_message_context.get('chat_id'),
+                                tool_call.name,
+                                f"🔧 Calling {tool_call.name}..."
+                            )
+                        except Exception as e:
+                            logger.warning(f"Tool output callback failed: {e}")
+                    
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    
+                    # Send tool result notification
+                    if self._tool_output_callback and self._current_message_context:
+                        try:
+                            result_preview = str(result)[:500] + "..." if len(str(result)) > 500 else str(result)
+                            await self._tool_output_callback(
+                                self._current_message_context.get('channel'),
+                                self._current_message_context.get('chat_id'),
+                                tool_call.name,
+                                f"✅ {tool_call.name} completed:\n{result_preview}"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Tool output callback failed: {e}")
+                    
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
-                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
+                messages.append({"role": "user", "content": "Based on the tool results above, decide your next action. If the task is complete, provide your final response to the user. If you need more information or actions, continue with the next step. Consider: 1) Did the tools return what you expected? 2) Do you need to make additional tool calls? 3) Is there any error that needs to be addressed?"})
             else:
                 final_content = response.content
                 break
 
-        return final_content, tools_used
+        return final_content, tools_used, model_name
 
     async def process_direct(
         self,

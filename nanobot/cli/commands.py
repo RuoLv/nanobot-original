@@ -384,6 +384,25 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus)
     
+    # Set up tool output callback for channels
+    async def tool_output_callback(channel: str, chat_id: str, tool_name: str, output: str):
+        """Callback to send real-time tool output through channel."""
+        from nanobot.bus.events import OutboundMessage
+        await bus.publish_outbound(OutboundMessage(
+            channel=channel,
+            chat_id=chat_id,
+            content=output,
+            metadata={"is_tool_output": True, "tool_name": tool_name}
+        ))
+    
+    # Register callback for all channels that support it
+    for channel in channels.channels.values():
+        if hasattr(channel, 'set_tool_output_callback'):
+            channel.set_tool_output_callback(tool_output_callback)
+    
+    # Also register callback on agent
+    agent.set_tool_output_callback(tool_output_callback)
+    
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:

@@ -30,6 +30,7 @@ try:
         CreateMessageReactionRequestBody,
         CreateMessageRequest,
         CreateMessageRequestBody,
+        DeleteMessageReactionRequest,
         Emoji,
         GetMessageResourceRequest,
         P2ImMessageReceiveV1,
@@ -134,6 +135,7 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._tool_output_callback: Any = None
     
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -201,8 +203,8 @@ class FeishuChannel(BaseChannel):
                 logger.warning(f"Error stopping WebSocket client: {e}")
         logger.info("Feishu bot stopped")
     
-    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
-        """Sync helper for adding reaction (runs in thread pool)."""
+    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> str | None:
+        """Sync helper for adding reaction (runs in thread pool). Returns reaction_id on success."""
         try:
             request = CreateMessageReactionRequest.builder() \
                 .message_id(message_id) \
@@ -216,22 +218,51 @@ class FeishuChannel(BaseChannel):
             
             if not response.success():
                 logger.warning(f"Failed to add reaction: code={response.code}, msg={response.msg}")
-            else:
-                logger.debug(f"Added {emoji_type} reaction to message {message_id}")
+                return None
+            
+            reaction_id = response.data.reaction_id if response.data else None
+            logger.debug(f"Added {emoji_type} reaction to message {message_id}, reaction_id: {reaction_id}")
+            return reaction_id
         except Exception as e:
             logger.warning(f"Error adding reaction: {e}")
+            return None
 
-    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> None:
+    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> str | None:
         """
-        Add a reaction emoji to a message (non-blocking).
+        Add a reaction emoji to a message (non-blocking). Returns reaction_id on success.
         
         Common emoji types: THUMBSUP, OK, EYES, DONE, OnIt, HEART
         """
         if not self._client or not Emoji:
+            return None
+        
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+    
+    def _delete_reaction_sync(self, message_id: str, reaction_id: str) -> None:
+        """Sync helper for deleting reaction (runs in thread pool)."""
+        try:
+            request = DeleteMessageReactionRequest.builder() \
+                .message_id(message_id) \
+                .reaction_id(reaction_id) \
+                .build()
+            
+            response = self._client.im.v1.message_reaction.delete(request)
+            
+            if not response.success():
+                logger.warning(f"Failed to delete reaction: code={response.code}, msg={response.msg}")
+            else:
+                logger.debug(f"Deleted reaction from message {message_id}")
+        except Exception as e:
+            logger.warning(f"Error deleting reaction: {e}")
+    
+    async def _delete_reaction(self, message_id: str, reaction_id: str) -> None:
+        """Delete a reaction from a message (non-blocking)."""
+        if not self._client:
             return
         
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+        await loop.run_in_executor(None, self._delete_reaction_sync, message_id, reaction_id)
     
     def _create_message(self, receive_id: str, receive_id_type: str, msg_type: str, content: str) -> Any:
         """Create a message through Feishu API.
@@ -335,12 +366,50 @@ class FeishuChannel(BaseChannel):
         return elements or [{"tag": "markdown", "content": content}]
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Feishu."""
-        if not self._client:
-            logger.warning("Feishu client not initialized")
+        """Send a message to Feishu."""
+        # Check if this is a tool output message
+        if msg.metadata.get("is_tool_output"):
+            await self._send_tool_output(msg)
             return
         
+        # Determine receive_id_type based on chat_id format
+        # open_id starts with "ou_", chat_id starts with "oc_"
+        if msg.chat_id.startswith("oc_"):
+            receive_id_type = "chat_id"
+        else:
+            receive_id_type = "open_id"
+        
+        # Check message type and route accordingly
+        msg_type = msg.metadata.get("type", "text")
+        
+        if msg_type == "interactive":
+            # Interactive card message
+            sent_message_id = await self._send_interactive(msg, receive_id_type)
+        elif msg.media:
+            # Media (image/file) message
+            sent_message_id = await self._send_media(msg, receive_id_type)
+        else:
+            # Text message
+            sent_message_id = await self._send_text(msg, receive_id_type, msg.content)
+        
+        # Store message_id for reaction updates
+        if sent_message_id:
+            msg.message_id = sent_message_id
+        
+        # Update reactions on the original user message: remove Typing, add DONE
+        typing_reaction_id = msg.metadata.get("typing_reaction_id")
+        original_message_id = msg.metadata.get("message_id")
+        if typing_reaction_id and original_message_id:
+            await self._delete_reaction(original_message_id, typing_reaction_id)
+        if original_message_id:
+            await self._add_reaction(original_message_id, "DONE")
+    
+    async def _send_tool_output(self, msg: OutboundMessage) -> None:
+        """Send real-time tool output to user."""
         try:
+            tool_name = msg.metadata.get("tool_name", "tool")
+            output = msg.content
+            
             # Determine receive_id_type based on chat_id format
             # open_id starts with "ou_", chat_id starts with "oc_"
             if msg.chat_id.startswith("oc_"):
@@ -348,36 +417,58 @@ class FeishuChannel(BaseChannel):
             else:
                 receive_id_type = "open_id"
             
-            # Handle media messages (image, file)
-            if msg.media:
-                await self._send_media(msg, receive_id_type)
-                return
+            # Build content with tool output
+            content = json.dumps({
+                "text": f"{output}"
+            }, ensure_ascii=False)
             
-            # Build card with markdown + table support
-            elements = self._build_card_elements(msg.content)
-            card = {
-                "config": {"wide_screen_mode": True},
-                "elements": elements,
-            }
-            content = json.dumps(card, ensure_ascii=False)
+            request = CreateMessageRequest.builder() \
+                .receive_id_type(receive_id_type) \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(msg.chat_id)
+                    .msg_type("text")
+                    .content(content)
+                    .build()
+                ).build()
             
-            response = self._create_message(msg.chat_id, receive_id_type, "interactive", content)
+            response = self._client.im.v1.message.create(request)
             
             if not response.success():
-                logger.error(
-                    f"Failed to send Feishu message: code={response.code}, "
-                    f"msg={response.msg}, log_id={response.get_log_id()}"
-                )
+                logger.warning(f"Failed to send tool output: {response.msg}")
             else:
-                logger.debug(f"Feishu message sent to {msg.chat_id}")
+                logger.debug(f"Tool output sent to {msg.chat_id}")
                 
         except Exception as e:
-            logger.error(f"Error sending Feishu message: {e}")
+            logger.error(f"Error sending tool output: {e}")
     
-    async def _send_media(self, msg: OutboundMessage, receive_id_type: str) -> None:
-        """Send media message (image or file) through Feishu."""
+    def set_tool_output_callback(self, callback) -> None:
+        """Set callback for real-time tool output."""
+        self._tool_output_callback = callback
+    
+    async def _send_interactive(self, msg: OutboundMessage, receive_id_type: str) -> str | None:
+        """Send interactive card message. Returns message_id on success."""
+        elements = self._build_card_elements(msg.content)
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": elements,
+        }
+        content = json.dumps(card, ensure_ascii=False)
+        
+        response = self._create_message(msg.chat_id, receive_id_type, "interactive", content)
+        
+        if not response.success():
+            logger.error(f"Failed to send interactive message: {response.msg}")
+            return None
+        
+        message_id = response.data.message_id if response.data else None
+        logger.debug(f"Interactive message sent to {msg.chat_id}, message_id: {message_id}")
+        return message_id
+    
+    async def _send_media(self, msg: OutboundMessage, receive_id_type: str) -> str | None:
+        """Send media message (image or file) through Feishu. Returns message_id on success."""
         if not msg.media:
-            return
+            return None
         
         media_type = msg.media.get("type")
         media_url = msg.media.get("url")
@@ -386,15 +477,15 @@ class FeishuChannel(BaseChannel):
         
         try:
             if media_type in ["image", "file"]:
-                await self._upload_and_send_media(msg, receive_id_type, media_type, media_path, media_content)
+                return await self._upload_and_send_media(msg, receive_id_type, media_type, media_path, media_content)
             else:
                 # Fallback to text message with media URL
                 content = f"{msg.content}\n\n[Media: {media_url}]" if msg.content else f"[Media: {media_url}]"
-                await self._send_text(msg, receive_id_type, content)
+                return await self._send_text(msg, receive_id_type, content)
         except Exception as e:
             logger.error(f"Error sending media: {e}")
             # Fallback to text message
-            await self._send_text(msg, receive_id_type, msg.content or "[Failed to send media]")
+            return await self._send_text(msg, receive_id_type, msg.content or "[Failed to send media]")
     
     async def _upload_and_send_media(
         self,
@@ -403,16 +494,8 @@ class FeishuChannel(BaseChannel):
         media_type: str,
         media_path: str | None,
         media_content: bytes | None
-    ) -> None:
-        """Upload and send media (image or file) through Feishu.
-        
-        Args:
-            msg: Outbound message
-            receive_id_type: Receive ID type
-            media_type: Media type ("image" or "file")
-            media_path: Local file path
-            media_content: File content bytes
-        """
+    ) -> str | None:
+        """Upload and send media (image or file) through Feishu. Returns message_id on success."""
         # Get file as file-like object
         if media_path:
             file_obj = open(media_path, "rb")
@@ -440,7 +523,9 @@ class FeishuChannel(BaseChannel):
             if not response.success():
                 raise Exception(f"Failed to send {media_type}: {response.msg}")
             
-            logger.debug(f"{media_type.capitalize()} sent to {msg.chat_id}")
+            message_id = response.data.message_id if response.data else None
+            logger.debug(f"{media_type.capitalize()} sent to {msg.chat_id}, message_id: {message_id}")
+            return message_id
             
         finally:
             # Close file if we opened it
@@ -497,8 +582,8 @@ class FeishuChannel(BaseChannel):
         
         return response.data.file_key
     
-    async def _send_text(self, msg: OutboundMessage, receive_id_type: str, content: str) -> None:
-        """Send a simple text message."""
+    async def _send_text(self, msg: OutboundMessage, receive_id_type: str, content: str) -> str | None:
+        """Send a simple text message. Returns message_id on success."""
         elements = self._build_card_elements(content)
         card = {
             "config": {"wide_screen_mode": True},
@@ -510,8 +595,11 @@ class FeishuChannel(BaseChannel):
         
         if not response.success():
             logger.error(f"Failed to send text: {response.msg}")
-        else:
-            logger.debug(f"Text sent to {msg.chat_id}")
+            return None
+        
+        message_id = response.data.message_id if response.data else None
+        logger.debug(f"Text sent to {msg.chat_id}, message_id: {message_id}")
+        return message_id
     
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """
@@ -634,7 +722,7 @@ class FeishuChannel(BaseChannel):
             msg_type = message.message_type
             
             # Add reaction to indicate "seen"
-            await self._add_reaction(message_id, "THUMBSUP")
+            typing_reaction_id = await self._add_reaction(message_id, "Typing")
             
             # Parse message content
             media_paths = []
@@ -669,6 +757,7 @@ class FeishuChannel(BaseChannel):
                     "message_id": message_id,
                     "chat_type": chat_type,
                     "msg_type": msg_type,
+                    "typing_reaction_id": typing_reaction_id,
                 }
             )
 

@@ -179,8 +179,8 @@ class LiteLLMProvider(LLMProvider):
                 response = await acompletion(**kwargs)
                 parsed_response = self._parse_response(response)
                 
-                # Add model information to the response content
-                parsed_response = self._add_model_info_to_response(parsed_response, model)
+                # Store model name in response for channel to use
+                parsed_response.model = model
                 
                 # Record token usage with original model name
                 self._record_token_usage(parsed_response, original_model)
@@ -226,8 +226,8 @@ class LiteLLMProvider(LLMProvider):
                     response = await acompletion(**fallback_kwargs)
                     parsed_response = self._parse_response(response)
                     
-                    # Add model information to the response content
-                    parsed_response = self._add_model_info_to_response(parsed_response, fallback_model_resolved)
+                    # Store model name in response for channel to use
+                    parsed_response.model = fallback_model_resolved
                     
                     # Record token usage for fallback model with original model name
                     self._record_token_usage(parsed_response, self.fallback_model)
@@ -292,26 +292,6 @@ class LiteLLMProvider(LLMProvider):
             usage=usage,
             reasoning_content=reasoning_content,
         )
-    
-    def _add_model_info_to_response(self, response: LLMResponse, model: str) -> LLMResponse:
-        """Add model information to the response content."""
-        import traceback
-        
-        if response.content:
-            # Extract just the model name without prefix
-            model_name = model
-            
-            # Debug: Log call stack to track where this is called from
-            stack = traceback.extract_stack()
-            call_stack = []
-            for frame in stack[-5:-1]:  # Get last 4 frames (excluding this one)
-                call_stack.append(f"  {frame.filename}:{frame.lineno} in {frame.name}")
-            logger.debug(f"_add_model_info_to_response called for model '{model_name}'")
-            logger.debug(f"Call stack:\n" + "\n".join(call_stack))
-            logger.debug(f"Content starts with model info: {response.content.startswith(f'[{model_name}]:')}")
-            
-            response.content = f"[{model_name}]:\n{response.content}"
-        return response
 
     async def _send_error_notification(self, notification: str) -> None:
         """Send error notification to client if callback is provided."""

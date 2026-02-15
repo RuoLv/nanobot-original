@@ -48,6 +48,15 @@ class BaseChannel(ABC):
         """Stop the channel and clean up resources."""
         pass
     
+    def set_tool_output_callback(self, callback) -> None:
+        """Set callback for real-time tool output.
+        
+        Args:
+            callback: Async function to call when tool output is available.
+                     Signature: async def callback(channel, chat_id, tool_name, output)
+        """
+        pass
+    
     @abstractmethod
     async def send(self, msg: OutboundMessage) -> None:
         """

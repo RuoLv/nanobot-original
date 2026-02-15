@@ -33,5 +33,6 @@ class OutboundMessage:
     reply_to: str | None = None
     media: dict[str, Any] | None = None  # Media info: {type, path, name, content}
     metadata: dict[str, Any] = field(default_factory=dict)
+    message_id: str | None = None  # For updating reactions on sent messages
 
 
