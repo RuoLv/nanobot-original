@@ -405,10 +405,13 @@ class FeishuChannel(BaseChannel):
             await self._add_reaction(original_message_id, "DONE")
     
     async def _send_tool_output(self, msg: OutboundMessage) -> None:
-        """Send real-time tool output to user."""
+        """Send real-time tool output to user with styling."""
         try:
             tool_name = msg.metadata.get("tool_name", "tool")
-            output = msg.content
+            output = msg.content or ""
+            
+            if not output:
+                return
             
             # Determine receive_id_type based on chat_id format
             # open_id starts with "ou_", chat_id starts with "oc_"
@@ -417,9 +420,19 @@ class FeishuChannel(BaseChannel):
             else:
                 receive_id_type = "open_id"
             
-            # Build content with tool output
+            # Use Feishu post message with code_block for small gray text effect
             content = json.dumps({
-                "text": f"{output}"
+                "zh_cn": {
+                    "title": f"🔧 {tool_name}",
+                    "content": [
+                        [
+                            {
+                                "tag": "code_block",
+                                "text": output
+                            }
+                        ]
+                    ]
+                }
             }, ensure_ascii=False)
             
             request = CreateMessageRequest.builder() \
@@ -427,7 +440,7 @@ class FeishuChannel(BaseChannel):
                 .request_body(
                     CreateMessageRequestBody.builder()
                     .receive_id(msg.chat_id)
-                    .msg_type("text")
+                    .msg_type("post")
                     .content(content)
                     .build()
                 ).build()

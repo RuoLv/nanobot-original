@@ -408,7 +408,8 @@ Text to compress:
             greeting_response = await self._generate_new_session_greeting()
             
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content=greeting_response)
+                                  content=greeting_response,
+                                  metadata=msg.metadata or {})
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
