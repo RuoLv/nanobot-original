@@ -57,14 +57,10 @@ class MessageTool(Tool):
                     "type": "string",
                     "description": "Optional: target chat/user ID"
                 },
-                "file_path": {
-                    "type": "string",
-                    "description": "Optional: path to a file or image to send. Supports images (.png, .jpg, .jpeg, .gif) and files."
-                },
-                "file_type": {
-                    "type": "string",
-                    "description": "Optional: type of file to send. 'image' for images, 'file' for other files. Auto-detected if not specified.",
-                    "enum": ["image", "file"]
+                "media": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional: list of file paths to attach (images, audio, documents)"
                 }
             },
             "required": ["content"]
@@ -75,18 +71,11 @@ class MessageTool(Tool):
         content: str = "",
         channel: str | None = None,
         chat_id: str | None = None,
-        file_path: str | None = None,
-        file_type: str | None = None,
+        media: list[str] | None = None,
         **kwargs: Any
     ) -> str:
         from loguru import logger
-        logger.debug(f"MessageTool.execute: content={content[:30] if content else 'EMPTY'}, file_path={file_path}, kwargs={kwargs}")
-
-        # Handle camelCase parameters from some LLMs
-        if not file_path:
-            file_path = kwargs.pop("filePath", None) or kwargs.pop("filepath", None)
-        if not file_type:
-            file_type = kwargs.pop("fileType", None) or kwargs.pop("filetype", None)
+        logger.debug(f"MessageTool.execute: content={content[:30] if content else 'EMPTY'}, media={media}, kwargs={kwargs}")
 
         # Validate required parameter
         if not content:
@@ -101,38 +90,26 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
         
-        # Build media info if file_path provided
-        media = None
-        if file_path:
-            path = Path(file_path)
-            if not path.exists():
-                return f"Error: File not found: {file_path}"
-            
-            # Auto-detect file type if not specified
-            if not file_type:
-                ext = path.suffix.lower()
-                if ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
-                    file_type = "image"
-                else:
-                    file_type = "file"
-            
-            media = {
-                "type": file_type,
-                "path": str(path.absolute()),
-                "name": path.name
-            }
+        # Validate media files if provided
+        if media:
+            validated_media = []
+            for file_path in media:
+                path = Path(file_path)
+                if not path.exists():
+                    return f"Error: File not found: {file_path}"
+                validated_media.append(str(path.absolute()))
+            media = validated_media
         
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
             content=content,
-            media=media
+            media=media or []
         )
         
         try:
             await self._send_callback(msg)
-            if media:
-                return f"Message with {media['type']} sent to {channel}:{chat_id}"
-            return f"Message sent to {channel}:{chat_id}"
+            media_info = f" with {len(media)} attachments" if media else ""
+            return f"Message sent to {channel}:{chat_id}{media_info}"
         except Exception as e:
             return f"Error sending message: {str(e)}"

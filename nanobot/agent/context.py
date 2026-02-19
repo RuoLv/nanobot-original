@@ -189,8 +189,9 @@ This folder contains daily conversation logs:
 - **USER.md**: Continuously refine user profile through interactions
 - **HEARTBEAT.md**: Only for system-level periodic tasks (ask user if unsure)
 
-Always be helpful, accurate, and concise. When using tools, think step by step: what you know, what you need, and why you chose this tool.
-"""
+Always be helpful, accurate, and concise. Before calling tools, briefly tell the user what you're about to do (one short sentence in the user's language).
+When remembering something important, write to {workspace_path}/memory/MEMORY.md
+To recall past events, grep {workspace_path}/memory/HISTORY.md"""
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -334,14 +335,18 @@ Always be helpful, accurate, and concise. When using tools, think step by step: 
         Returns:
             Updated message list.
         """
-        msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
-        
+        msg: dict[str, Any] = {"role": "assistant"}
+
+        # Omit empty content — some backends reject empty text blocks
+        if content:
+            msg["content"] = content
+
         if tool_calls:
             msg["tool_calls"] = tool_calls
-        
-        # Thinking models reject history without this
+
+        # Include reasoning content when provided (required by some thinking models)
         if reasoning_content:
             msg["reasoning_content"] = reasoning_content
-        
+
         messages.append(msg)
         return messages

@@ -4,7 +4,8 @@ import asyncio
 from contextlib import AsyncExitStack
 import json
 from pathlib import Path
-from typing import Any, Callable
+import re
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -178,6 +179,38 @@ class AgentLoop:
             callback: Async function that accepts (channel, chat_id, tool_name, output) or None to disable
         """
         self._tool_output_callback = callback
+
+    @staticmethod
+    def _strip_think(text: str | None) -> str | None:
+        """Remove </think> blocks that some models embed in content."""
+        if not text:
+            return None
+        return re.sub(r"</think>[\s\S]*?<think>[\s\S]*?</think>", "", text).strip() or None
+
+    @staticmethod
+    def _tool_hint(tool_calls: list) -> str:
+        """Format tool calls as concise hint, e.g. 'web_search("query")'."""
+        def _fmt(tc):
+            val = next(iter(tc.arguments.values()), None) if tc.arguments else None
+            if not isinstance(val, str):
+                return tc.name
+            return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
+        return ", ".join(_fmt(tc) for tc in tool_calls)
+
+    async def _run_agent_loop(
+        self,
+        initial_messages: list[dict],
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> tuple[str | None, list[str]]:
+        """Run the agent loop with LLM interactions.
+
+        Args:
+            initial_messages: Starting messages for the LLM conversation.
+            on_progress: Optional callback to push intermediate content to the user.
+
+        Returns:
+            Tuple of (final_content, tools_used_list).
+        """
 
     def _load_max_window_context(self) -> int:
         """Load max_window_context from config, default to 100000."""
@@ -357,13 +390,19 @@ Text to compress:
         self._running = False
         logger.info("Agent loop stopping")
     
-    async def _process_message(self, msg: InboundMessage, session_key: str | None = None) -> OutboundMessage | None:
+    async def _process_message(
+        self,
+        msg: InboundMessage,
+        session_key: str | None = None,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> OutboundMessage | None:
         """
         Process a single inbound message.
         
         Args:
             msg: The inbound message to process.
             session_key: Override session key (used by process_direct).
+            on_progress: Optional callback for intermediate output (defaults to bus publish).
         
         Returns:
             The response message, or None if no response needed.
@@ -595,6 +634,16 @@ Text to compress:
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+        )
+
+        async def _bus_progress(content: str) -> None:
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=content,
+                metadata=msg.metadata or {},
+            ))
+
+        final_content, tools_used = await self._run_agent_loop(
+            initial_messages, on_progress=on_progress or _bus_progress,
         )
 
 
@@ -889,6 +938,7 @@ Summary (in Chinese):"""
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
@@ -898,6 +948,7 @@ Summary (in Chinese):"""
             session_key: Session identifier (overrides channel:chat_id for session lookup).
             channel: Source channel (for tool context routing).
             chat_id: Source chat ID (for tool context routing).
+            on_progress: Optional callback for intermediate output.
         
         Returns:
             The agent's response.
@@ -910,5 +961,5 @@ Summary (in Chinese):"""
             content=content
         )
         
-        response = await self._process_message(msg, session_key=session_key)
+        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
         return response.content if response else ""
