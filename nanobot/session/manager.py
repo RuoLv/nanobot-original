@@ -254,7 +254,7 @@ class SessionManager:
             if legacy_path.exists():
                 import shutil
                 shutil.move(str(legacy_path), str(path))
-                logger.info(f"Migrated session {key} from legacy path")
+                logger.info("Migrated session {} from legacy path", key)
 
         if not path.exists():
             return None
@@ -267,7 +267,6 @@ class SessionManager:
             last_consolidated = 0
 
             with open(path, encoding="utf-8") as f:
-
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -293,17 +292,17 @@ class SessionManager:
 
             )
         except Exception as e:
-            logger.warning(f"Failed to load session {key}: {e}")
+            logger.warning("Failed to load session {}: {}", key, e)
             return None
     
     def save(self, session: Session) -> None:
         """Save a session to disk."""
         path = self._get_session_path(session.key)
-        
+
         with open(path, "w", encoding="utf-8") as f:
-            # Write metadata first
             metadata_line = {
                 "_type": "metadata",
+                "key": session.key,
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
@@ -311,10 +310,8 @@ class SessionManager:
             }
             f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
             
-            # Write messages
             for msg in session.messages:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
-        
         self._cache[session.key] = session
     
     def invalidate(self, key: str) -> None:
@@ -379,8 +376,9 @@ class SessionManager:
                     if first_line:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
+                            key = data.get("key") or path.stem.replace("_", ":", 1)
                             sessions.append({
-                                "key": path.stem.replace("_", ":"),
+                                "key": key,
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
                                 "path": str(path)
