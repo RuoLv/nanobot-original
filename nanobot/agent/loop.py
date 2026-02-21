@@ -201,7 +201,7 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[[str], Awaitable[None]] | None = None,
-    ) -> tuple[str | None, list[str]]:
+    ) -> tuple[str | None, list[str], str | None]:
         """Run the agent loop with LLM interactions.
 
         Args:
@@ -209,8 +209,90 @@ class AgentLoop:
             on_progress: Optional callback to push intermediate content to the user.
 
         Returns:
-            Tuple of (final_content, tools_used_list).
+            Tuple of (final_content, tools_used_list, model_name).
         """
+        messages = initial_messages
+        iteration = 0
+        final_content = None
+        tools_used: list[str] = []
+        model_name = None
+
+        while iteration < self.max_iterations:
+            iteration += 1
+
+            response = await self.provider.chat(
+                messages=messages,
+                tools=self.tools.get_definitions(),
+                model=self.model
+            )
+            
+            # Capture model name from response
+            if response.model:
+                model_name = response.model
+
+            if response.has_tool_calls:
+                # Send intermediate output if callback provided
+                if on_progress:
+                    clean = self._strip_think(response.content)
+                    await on_progress(clean or self._tool_hint(response.tool_calls))
+
+                tool_call_dicts = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments)
+                        }
+                    }
+                    for tc in response.tool_calls
+                ]
+                messages = self.context.add_assistant_message(
+                    messages, response.content, tool_call_dicts,
+                    reasoning_content=response.reasoning_content,
+                )
+
+                for tool_call in response.tool_calls:
+                    tools_used.append(tool_call.name)
+                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    
+                    # Send tool output notification
+                    if self._tool_output_callback and self._current_message_context:
+                        try:
+                            await self._tool_output_callback(
+                                self._current_message_context.get('channel'),
+                                self._current_message_context.get('chat_id'),
+                                tool_call.name,
+                                f"🔧 Calling {tool_call.name}..."
+                            )
+                        except Exception as e:
+                            logger.warning(f"Tool output callback failed: {e}")
+                    
+                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    
+                    # Send tool result notification
+                    if self._tool_output_callback and self._current_message_context:
+                        try:
+                            result_preview = str(result)[:500] + "..." if len(str(result)) > 500 else str(result)
+                            await self._tool_output_callback(
+                                self._current_message_context.get('channel'),
+                                self._current_message_context.get('chat_id'),
+                                tool_call.name,
+                                f"✅ {tool_call.name} completed:\n{result_preview}"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Tool output callback failed: {e}")
+                    
+                    messages = self.context.add_tool_result(
+                        messages, tool_call.id, tool_call.name, result
+                    )
+                messages.append({"role": "user", "content": "Based on the tool results above, decide your next action. If the task is complete, provide your final response to the user. If you need more information or actions, continue with the next step. Consider: 1) Did the tools return what you expected? 2) Do you need to make additional tool calls? 3) Is there any error that needs to be addressed?"})
+            else:
+                final_content = self._strip_think(response.content)
+                break
+
+        return final_content, tools_used, model_name
 
     def _load_max_window_context(self) -> int:
         """Load max_window_context from config, default to 100000."""
@@ -642,13 +724,10 @@ Text to compress:
                 metadata=msg.metadata or {},
             ))
 
-        final_content, tools_used = await self._run_agent_loop(
+        final_content, tools_used, model_name = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
         )
 
-
-        # Use the existing _run_agent_loop method
-        final_content, tools_used, model_name = await self._run_agent_loop(initial_messages)
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
         
@@ -822,115 +901,6 @@ Summary (in Chinese):"""
         except Exception as e:
             logger.error(f"Failed to generate new session greeting: {e}")
             return "新会话已开始，有什么可以帮助你的吗？"
-
-
-
-    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
-        """
-        Run the agent iteration loop.
-
-        Args:
-            initial_messages: Starting messages for the LLM conversation.
-
-        Returns:
-            Tuple of (final_content, list_of_tools_used, model_name).
-        """
-        messages = initial_messages
-        iteration = 0
-        final_content = None
-        tools_used: list[str] = []
-        model_name = None
-
-        while iteration < self.max_iterations:
-            iteration += 1
-
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model
-            )
-            
-            # Capture model name from response
-            if response.model:
-                model_name = response.model
-
-            if response.has_tool_calls:
-                # Send LLM's intermediate response (combine reasoning and content)
-                if self._tool_output_callback and self._current_message_context:
-                    try:
-                        parts = []
-                        if response.reasoning_content:
-                            parts.append(response.reasoning_content.strip())
-                        if response.content:
-                            parts.append(response.content.strip())
-                        if parts:
-                            combined = "    ".join(parts)
-                            await self._tool_output_callback(
-                                self._current_message_context.get('channel'),
-                                self._current_message_context.get('chat_id'),
-                                "🤔",
-                                f"🤔 Thinking...\n{combined}".strip()
-                            )
-                    except Exception as e:
-                        logger.warning(f"LLM intermediate output callback failed: {e}")
-                
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                )
-
-                for tool_call in response.tool_calls:
-                    tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    
-                    # Send tool call notification
-                    if self._tool_output_callback and self._current_message_context:
-                        try:
-                            await self._tool_output_callback(
-                                self._current_message_context.get('channel'),
-                                self._current_message_context.get('chat_id'),
-                                tool_call.name,
-                                f"🔧 Calling {tool_call.name}..."
-                            )
-                        except Exception as e:
-                            logger.warning(f"Tool output callback failed: {e}")
-                    
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    
-                    # Send tool result notification
-                    if self._tool_output_callback and self._current_message_context:
-                        try:
-                            result_preview = str(result)[:500] + "..." if len(str(result)) > 500 else str(result)
-                            await self._tool_output_callback(
-                                self._current_message_context.get('channel'),
-                                self._current_message_context.get('chat_id'),
-                                tool_call.name,
-                                f"✅ {tool_call.name} completed:\n{result_preview}"
-                            )
-                        except Exception as e:
-                            logger.warning(f"Tool output callback failed: {e}")
-                    
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-                messages.append({"role": "user", "content": "Based on the tool results above, decide your next action. If the task is complete, provide your final response to the user. If you need more information or actions, continue with the next step. Consider: 1) Did the tools return what you expected? 2) Do you need to make additional tool calls? 3) Is there any error that needs to be addressed?"})
-            else:
-                final_content = response.content
-                break
-
-        return final_content, tools_used, model_name
 
     async def process_direct(
         self,

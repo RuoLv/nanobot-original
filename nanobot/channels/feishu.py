@@ -365,6 +365,18 @@ class FeishuChannel(BaseChannel):
 
         return elements or [{"tag": "markdown", "content": content}]
 
+    @staticmethod
+    def _get_media_type(path: str) -> str:
+        """Guess media type from file extension."""
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        if ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp"):
+            return "image"
+        if ext in ("mp3", "m4a", "wav", "aac", "ogg", "flac"):
+            return "audio"
+        if ext in ("mp4", "avi", "mov", "mkv", "webm"):
+            return "video"
+        return "file"
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message to Feishu."""
         # Check if this is a tool output message
@@ -382,15 +394,22 @@ class FeishuChannel(BaseChannel):
         # Check message type and route accordingly
         msg_type = msg.metadata.get("type", "text")
         
+        logger.debug(f"[Feishu send] Starting send, chat_id={msg.chat_id}, msg_type={msg_type}, has_media={msg.media is not None}, content={msg.content[:50] if msg.content else 'None'}...")
+        
         if msg_type == "interactive":
             # Interactive card message
+            logger.debug(f"[Feishu send] Sending interactive message")
             sent_message_id = await self._send_interactive(msg, receive_id_type)
         elif msg.media:
-            # Media (image/file) message
+            # Media (image/file) message - support multiple files
+            logger.debug(f"[Feishu send] Sending media message")
             sent_message_id = await self._send_media(msg, receive_id_type)
         else:
             # Text message
+            logger.debug(f"[Feishu send] Sending text message")
             sent_message_id = await self._send_text(msg, receive_id_type, msg.content)
+        
+        logger.debug(f"[Feishu send] Message sent, sent_message_id={sent_message_id}")
         
         # Store message_id for reaction updates
         if sent_message_id:
@@ -479,26 +498,67 @@ class FeishuChannel(BaseChannel):
         return message_id
     
     async def _send_media(self, msg: OutboundMessage, receive_id_type: str) -> str | None:
-        """Send media message (image or file) through Feishu. Returns message_id on success."""
+        """Send media message (image/file) through Feishu. Returns message_id on success."""
+        logger.debug(f"[Feishu _send_media] Starting media send, chat_id={msg.chat_id}, receive_id_type={receive_id_type}")
+        logger.debug(f"[Feishu _send_media] msg.media type: {type(msg.media)}, value: {msg.media}")
+        
         if not msg.media:
+            logger.warning(f"[Feishu _send_media] No media found in message")
             return None
         
-        media_type = msg.media.get("type")
-        media_url = msg.media.get("url")
-        media_path = msg.media.get("path")
-        media_content = msg.media.get("content")  # bytes
+        # Support both old dict format and new list format
+        media_list = msg.media if isinstance(msg.media, list) else [msg.media]
+        logger.debug(f"[Feishu _send_media] Media list length: {len(media_list)}")
         
-        try:
-            if media_type in ["image", "file"]:
-                return await self._upload_and_send_media(msg, receive_id_type, media_type, media_path, media_content)
-            else:
-                # Fallback to text message with media URL
-                content = f"{msg.content}\n\n[Media: {media_url}]" if msg.content else f"[Media: {media_url}]"
-                return await self._send_text(msg, receive_id_type, content)
-        except Exception as e:
-            logger.error(f"Error sending media: {e}")
-            # Fallback to text message
-            return await self._send_text(msg, receive_id_type, msg.content or "[Failed to send media]")
+        last_message_id = None
+        
+        # Send each media file
+        for idx, media_item in enumerate(media_list):
+            logger.debug(f"[Feishu _send_media] Processing media item {idx+1}/{len(media_list)}: {media_item}")
+            try:
+                # Handle both dict format and string path format
+                if isinstance(media_item, dict):
+                    media_path = media_item.get("path")
+                    media_content = media_item.get("content")
+                    media_type = media_item.get("type")
+                    logger.debug(f"[Feishu _send_media] Dict format - path={media_path}, type={media_type}, has_content={media_content is not None}")
+                else:
+                    # String path - auto-detect type
+                    media_path = media_item
+                    media_content = None
+                    media_type = self._get_media_type(media_path) if media_path else "file"
+                    logger.debug(f"[Feishu _send_media] String format - path={media_path}, auto_type={media_type}")
+                
+                if not media_path and not media_content:
+                    logger.warning(f"[Feishu _send_media] Skipping invalid media item: {media_item}")
+                    continue
+                
+                # Upload and send media
+                logger.info(f"[Feishu _send_media] Uploading {media_type}: {media_path or 'content'}")
+                message_id = await self._upload_and_send_media(
+                    msg, receive_id_type, media_type, media_path, media_content
+                )
+                
+                if message_id:
+                    logger.info(f"[Feishu _send_media] ✓ Media sent successfully, message_id={message_id}")
+                    last_message_id = message_id
+                else:
+                    logger.warning(f"[Feishu _send_media] ✗ Media send returned None")
+                    
+            except Exception as e:
+                logger.error(f"[Feishu _send_media] Error sending media item {idx+1}: {e}", exc_info=True)
+                # Continue with next media item
+        
+        # Send text content if present
+        if msg.content and msg.content != "[empty message]":
+            logger.debug(f"[Feishu _send_media] Sending text content: {msg.content[:100]}...")
+            text_message_id = await self._send_text(msg, receive_id_type, msg.content)
+            if text_message_id:
+                logger.debug(f"[Feishu _send_media] Text sent, message_id={text_message_id}")
+                last_message_id = text_message_id
+        
+        logger.debug(f"[Feishu _send_media] Completed, last_message_id={last_message_id}")
+        return last_message_id
     
     async def _upload_and_send_media(
         self,
@@ -509,41 +569,53 @@ class FeishuChannel(BaseChannel):
         media_content: bytes | None
     ) -> str | None:
         """Upload and send media (image or file) through Feishu. Returns message_id on success."""
+        logger.debug(f"[Feishu _upload_and_send_media] Starting, media_type={media_type}, media_path={media_path}, has_content={media_content is not None}")
+        
         # Get file as file-like object
         if media_path:
+            logger.debug(f"[Feishu _upload_and_send_media] Opening file: {media_path}")
             file_obj = open(media_path, "rb")
             file_name = media_path.split("/")[-1]
         elif media_content:
+            logger.debug(f"[Feishu _upload_and_send_media] Using content bytes, size={len(media_content)}")
             file_obj = BytesIO(media_content)
             file_name = msg.media.get("name", "file") if media_type == "file" else "image"
         else:
+            logger.error(f"[Feishu _upload_and_send_media] No media content provided")
             raise ValueError("No media content provided")
         
         try:
             # Upload media
             if media_type == "image":
+                logger.debug(f"[Feishu _upload_and_send_media] Uploading image...")
                 resource_key = await self._upload_image(file_obj)
+                logger.debug(f"[Feishu _upload_and_send_media] Image uploaded, image_key={resource_key}")
                 msg_type = "image"
                 content = json.dumps({"image_key": resource_key})
             else:  # file
+                logger.debug(f"[Feishu _upload_and_send_media] Uploading file: {file_name}")
                 resource_key = await self._upload_file(file_obj, file_name)
+                logger.debug(f"[Feishu _upload_and_send_media] File uploaded, file_key={resource_key}")
                 msg_type = "file"
                 content = json.dumps({"file_key": resource_key})
             
             # Send message
+            logger.debug(f"[Feishu _upload_and_send_media] Creating message, msg_type={msg_type}, chat_id={msg.chat_id}")
             response = self._create_message(msg.chat_id, receive_id_type, msg_type, content)
             
             if not response.success():
+                logger.error(f"[Feishu _upload_and_send_media] Failed to send {media_type}: {response.msg}")
                 raise Exception(f"Failed to send {media_type}: {response.msg}")
             
             message_id = response.data.message_id if response.data else None
-            logger.debug(f"{media_type.capitalize()} sent to {msg.chat_id}, message_id: {message_id}")
+            logger.debug(f"[Feishu _upload_and_send_media] {media_type.capitalize()} sent to {msg.chat_id}, message_id: {message_id}")
             return message_id
             
         finally:
             # Close file if we opened it
             if media_path:
                 file_obj.close()
+                logger.debug(f"[Feishu _upload_and_send_media] File closed")
     
     async def _upload_image(self, image_file: Any) -> str:
         """Upload image and return image_key.
@@ -554,6 +626,7 @@ class FeishuChannel(BaseChannel):
         Returns:
             Image key
         """
+        logger.debug(f"[Feishu _upload_image] Creating upload request...")
         request = CreateImageRequest.builder() \
             .request_body(
                 CreateImageRequestBody.builder()
@@ -562,12 +635,18 @@ class FeishuChannel(BaseChannel):
                 .build()
             ).build()
         
+        logger.debug(f"[Feishu _upload_image] Sending upload request to Feishu API...")
         response = self._client.im.v1.image.create(request)
         
+        logger.debug(f"[Feishu _upload_image] Response success={response.success()}, msg={response.msg}")
+        
         if not response.success():
+            logger.error(f"[Feishu _upload_image] Failed to upload image: {response.msg}")
             raise Exception(f"Failed to upload image: {response.msg}")
         
-        return response.data.image_key
+        image_key = response.data.image_key
+        logger.debug(f"[Feishu _upload_image] Image uploaded successfully, image_key={image_key}")
+        return image_key
     
     async def _upload_file(self, file_obj: Any, file_name: str) -> str:
         """Upload file and return file_key.
@@ -579,6 +658,7 @@ class FeishuChannel(BaseChannel):
         Returns:
             File key
         """
+        logger.debug(f"[Feishu _upload_file] Creating upload request, file_name={file_name}...")
         request = CreateFileRequest.builder() \
             .request_body(
                 CreateFileRequestBody.builder()
@@ -588,12 +668,18 @@ class FeishuChannel(BaseChannel):
                 .build()
             ).build()
         
+        logger.debug(f"[Feishu _upload_file] Sending upload request to Feishu API...")
         response = self._client.im.v1.file.create(request)
         
+        logger.debug(f"[Feishu _upload_file] Response success={response.success()}, msg={response.msg}")
+        
         if not response.success():
+            logger.error(f"[Feishu _upload_file] Failed to upload file: {response.msg}")
             raise Exception(f"Failed to upload file: {response.msg}")
         
-        return response.data.file_key
+        file_key = response.data.file_key
+        logger.debug(f"[Feishu _upload_file] File uploaded successfully, file_key={file_key}")
+        return file_key
     
     async def _send_text(self, msg: OutboundMessage, receive_id_type: str, content: str) -> str | None:
         """Send a simple text message. Returns message_id on success."""
