@@ -530,10 +530,6 @@ Text to compress:
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
-<<<<<<< HEAD
-        
-
-
         self._set_tool_context(msg.channel, msg.chat_id)
         if cmd == "/reset":
             # Reset session without memory consolidation (like Feishu)
@@ -727,47 +723,12 @@ Text to compress:
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
-<<<<<<< HEAD
-        
-        # Clean up leading/trailing whitespace and newlines
-        final_content = final_content.strip()
-        
-        # Save to session without model prefix (only keep original content)
-=======
-
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
-
->>>>>>> upstream/main
-        session.add_message("user", msg.content)
-        session.add_message("assistant", final_content,
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
-<<<<<<< HEAD
-        
-        # Add model prefix to final output (only for user display)
-        if model_name:
-            final_content = f"[{model_name}]:\n{final_content}"
-        
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
-        
-        return OutboundMessage(
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            content=final_content,
-            metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
-            message_id=msg.metadata.get("message_id") if msg.metadata else None,
         )
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
-        """
-        Process a system message (e.g., subagent announce).
-        
-        The chat_id field contains "original_channel:original_chat_id" to route
-        the response back to the correct destination.
-        """
-        logger.info(f"Processing system message from {msg.sender_id}")
         
         # Parse origin from chat_id (format: "channel:chat_id")
         if ":" in msg.chat_id:
